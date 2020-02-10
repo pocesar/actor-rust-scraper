@@ -1,255 +1,76 @@
+extern crate futures;
 extern crate reqwest;
-extern crate serde_json;
 extern crate scraper;
 extern crate serde;
-extern crate rayon;
+extern crate serde_json;
 extern crate tokio;
-extern crate futures;
+extern crate async_std;
 
-#[macro_use] extern crate serde_derive;
+use async_std::prelude::*;
 
-use std::time::{Instant};
-use std::clone::Clone;
-use std::collections::HashMap;
+#[macro_use]
+extern crate serde_derive;
 
-use std::sync::{ Arc };
-use futures::lock::{Mutex};
-// use async_std::prelude::*;
-use async_std::task;
+pub trait Timestamp {
+    fn timestamp(&self) -> u64;
+}
 
-use scraper::{Selector, Html};
-use serde_json::{Value};
+impl Timestamp for SystemTime {
+    fn timestamp(&self) -> u64 {
+        self.duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+}
+
+fn timestamp() {
+    print!("[{}]: ", SystemTime::now().timestamp());
+}
+
+#[macro_export]
+macro_rules! debugln {
+  () => { debugln!("(DEBUG)") };
+  ($fmt:expr) => {
+    if let Ok(_) = std::env::var("APIFY_LOG_LEVEL") {
+        $crate::timestamp();
+        println!($fmt);
+    }
+  };
+  ($fmt:expr, $($arg:tt)*) => {
+    if let Ok(_) = std::env::var("APIFY_LOG_LEVEL") {
+        $crate::timestamp();
+        println!($fmt, $($arg)*);
+    }
+  };
+}
 
 mod crawler;
-mod requestlist;
-mod request;
+mod extractor;
 mod input;
-mod storage;
 mod proxy;
+mod request;
+mod requestlist;
+mod storage;
 
-use request::Request;
-use requestlist::RequestList;
 use crate::crawler::Crawler;
-use input::{Input, Extract, ExtractType, ProxySettings};
-use storage::{ push_data_async, request_text_async, push_data,request_text, get_value}; //
-use proxy::{get_apify_proxy};
-
+use crate::extractor::DataExtractor;
+use crate::input::{ Input };
+use std::{
+    env::args,
+    time::SystemTime,
+};
+use storage::Storage;
 
 // To not compile libraries on Apify, it is important to not commit Cargo.lock
 
 #[tokio::main]
 async fn main() {
-    let input: Input = get_value("INPUT");
-    println!("STATUS --- Loaded Input");
+    let storage = Storage::new(args().any(|arg| arg == "--force-cloud"));
+    let input = storage.get_value::<Input>("INPUT").await.expect("Failed to read INPUT");
 
-    /*
-    let input: Input = Input {
-        run_async: true,
-        urls: vec![Request { url: String::from("https://www.amazon.com/dp/B01CYYU8YW") }],
-        extract: vec![Extract {field_name: String::from("field") , selector: String::from("#productTitle"), extract_type:  ExtractType::Text }],
-        proxy_settings: Some(ProxySettings {useApifyProxy: true, apifyProxyGroups: None })
-    };
-    */
+    debugln!("STATUS --- Loaded Input");
 
-    let sources = input.urls.iter().map(|req| Request::new(req.url.clone())).collect();
+    //storage.start_send(SystemTime::now());
 
-    let req_list = RequestList::new(sources);
-
-    let crwl  = Crawler::new(req_list, input.extract, input.proxy_settings, input.push_data_size, input.force_cloud, input.debug_log);
-
-    if input.run_async {
-        println!("STATUS --- Starting Async Crawler");
-        // Comment on/off depending on using tokio
-        // task::block_on(async {
-            crwl.run_async().await;
-        // })
-    } else {
-        println!("STATUS --- Starting Sync Crawler");
-        crwl.run();
-    }
-}
-
-fn extract_data_from_url(
-    req: &Request,
-    extract: &Vec<Extract>,
-    client: &reqwest::blocking::Client,
-    proxy_client: &reqwest::blocking::Client,
-    push_data_size: usize,
-    push_data_buffer: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
-    force_cloud: bool,
-    debug_log: bool
-) {
-    let url = &req.url;
-    if debug_log {
-        println!("Started sync extraction --- {}", url);
-    }
-    
-    let now = Instant::now();
-    let html = request_text(&url, &proxy_client);
-    let request_time = now.elapsed().as_millis();
-
-    let now = Instant::now();
-    let dom = Html::parse_document(&html);
-    let parse_time = now.elapsed().as_millis();
-
-    let mut map: HashMap<String, Value> = HashMap::new();
-
-    let now = Instant::now();
-    extract.iter().for_each(|extr| {
-        let selector_bind = &extr.selector.clone();
-        let selector = Selector::parse(selector_bind).unwrap();
-        let element = dom.select(&selector).next();
-        let val = match element {
-            Some(element) => {
-                // println!("matched element");
-                let extracted_value = match &extr.extract_type {
-                    ExtractType::Text => element.text().fold(String::from(""), |acc, s| acc + s).trim().to_owned(),
-                    ExtractType::Attribute(at) => element.value().attr(&at).unwrap().to_owned()
-                };
-                Some(extracted_value)
-            },
-            None => None
-        };
-        let insert_value = match val {
-            Some(string) => Value::String(string),
-            None => Value::Null,
-        };
-        map.insert(extr.field_name.clone(), insert_value);
-    });
-
-    let mapSize = map.len();
-
-    let value = serde_json::to_value(map).unwrap();
-    let extractTime = now.elapsed().as_millis();
-
-    let now = Instant::now();
-    {
-        let mut locked_vec = push_data_buffer.lock().unwrap();
-        locked_vec.push(value);
-        let vec_len = locked_vec.len();
-        if debug_log {
-            println!("Push data buffer length:{}", vec_len);
-        }
-        if vec_len >= push_data_size {
-            println!("Flushing data buffer --- length: {}", locked_vec.len());
-            push_data(locked_vec.clone(), &client, force_cloud); 
-            locked_vec.truncate(0);
-            println!("Flushed data buffer --- length: {}", locked_vec.len());
-        }
-    }
-    let push_time = now.elapsed().as_millis();
-
-    if debug_log {
-        println!(
-            "SUCCESS({}/{}) - {} - timings (in ms) - request: {}, parse: {}, extract: {}, push: {}",
-            mapSize,
-            extract.len(),
-            &req.url,
-            request_time,
-            parse_time,
-            extractTime,
-            push_time
-        );
-    }
-}
-
-async fn extract_data_from_url_async(
-        req: Request,
-        extract: &Vec<Extract>,
-        client: &reqwest::Client,
-        proxy_client: &reqwest::Client,
-        push_data_size: usize,
-        push_data_buffer: Arc<futures::lock::Mutex<Vec<serde_json::Value>>>,
-        force_cloud: bool,
-        debug_log: bool
-) {
-
-    let url = req.url.clone();
-    if debug_log {
-        println!("Started async extraction --- {}", url);
-    }
-
-    let now = Instant::now();
-    let response = request_text_async(url, &proxy_client).await;
-    let request_time = now.elapsed().as_millis();
-
-    // println!("Reqwest retuned");
-    match response {
-        Ok(html) => {
-            let now = Instant::now();
-            let dom = Html::parse_document(&html).clone();
-            let parse_time = now.elapsed().as_millis();
-        
-            let mut map: HashMap<String, Value> = HashMap::new();
-        
-            let now = Instant::now();
-            extract.iter().for_each(|extr| {
-                let selector_bind = &extr.selector.clone();
-                let selector = Selector::parse(selector_bind).unwrap();
-                let element = dom.select(&selector).next();
-                let val = match element {
-                    Some(element) => {
-                        // println!("matched element");
-                        let extracted_value = match &extr.extract_type {
-                            ExtractType::Text => element.text().fold(String::from(""), |acc, s| acc + s).trim().to_owned(),
-                            ExtractType::Attribute(at) => element.value().attr(&at).unwrap().to_owned()
-                        };
-                        Some(extracted_value)
-                    },
-                    None => None
-                };
-                let insert_value = match val {
-                    Some(string) => Value::String(string),
-                    None => Value::Null,
-                };
-                map.insert(extr.field_name.clone(), insert_value);
-            });
-        
-            let mapSize = map.len();
-        
-            let value = serde_json::to_value(map).unwrap();
-            let extract_time = now.elapsed().as_millis();
-        
-            let now = Instant::now();
-        
-            {
-                let mut locked_vec = push_data_buffer.lock().await;
-                locked_vec.push(value);
-                let vec_len = locked_vec.len();
-                if debug_log {
-                    println!("Push  data buffer length:{}", vec_len);
-                }
-                if vec_len >= push_data_size {
-                    println!("Flushing data buffer --- length: {}", locked_vec.len());
-                    push_data_async(locked_vec.clone(), &client, force_cloud).await; 
-                    locked_vec.truncate(0);
-                    println!("Flushed data buffer --- length: {}", locked_vec.len());
-                }
-            }
-            
-            let push_time = now.elapsed().as_millis();
-        
-            if debug_log {
-                println!(
-                    "SUCCESS({}/{}) - {} - timings (in ms) - request: {}, parse: {}, extract: {}, push: {}",
-                    mapSize,
-                    extract.len(),
-                    req.url,
-                    request_time,
-                    parse_time,
-                    extract_time,
-                    push_time
-                );
-            }
-        },
-        Err(err) => {
-            println!(
-                "FAILURE({} - timings (in ms) - request: {} --- {}",
-                err,
-                request_time,
-                req.url,
-            );
-        }
-    }
-    
+    Crawler::new(input).run(DataExtractor::new(), storage).await;
 }

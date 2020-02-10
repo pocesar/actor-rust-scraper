@@ -1,7 +1,8 @@
 use crate::input::ProxySettings;
 use std::env;
+use std::convert::{ TryFrom };
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Proxy {
     pub base_url: String,
     pub username: String,
@@ -18,29 +19,32 @@ impl Proxy {
     }
 }
 
-pub fn get_apify_proxy (settings: &Option<ProxySettings>) -> Option<Proxy> {
-    // println!("proxy settings {:?}", settings);
-    let use_apify_proxy = match settings {
-        None => false,
-        Some(settings) => settings.useApifyProxy
-    };
-    match use_apify_proxy {
-        false => None,
-        true => Some(construct_proxy(settings.clone().unwrap().apifyProxyGroups))
+impl Clone for Proxy {
+    fn clone(&self) -> Self {
+        Proxy {
+            base_url: self.base_url.to_string(),
+            password: self.password.to_string(),
+            username: self.username.to_string()
+        }
     }
 }
 
-fn construct_proxy (groups: Option<Vec<String>>) -> Proxy {
-    let password = match env::var("APIFY_PROXY_PASSWORD") {
-        Ok(pass) => pass,
-        Err(_) => panic!("Missing APIFY_PROXY_PASSWORD environment variable. This is required to use Apify proxy!")
-    };
-    let username = match groups {
-        None => "auto".to_owned(),
-        Some(groups) => {
-            let joined = groups.join("+");
-            format!("groups-{}", joined)
+impl TryFrom<Option<ProxySettings>> for Proxy {
+    type Error = ();
+    fn try_from(settings: Option<ProxySettings>) -> Result<Self, Self::Error> {
+        if let Some(settings) = settings {
+            if settings.useApifyProxy {
+                let password = env::var("APIFY_PROXY_PASSWORD")
+                    .expect("Missing APIFY_PROXY_PASSWORD environment variable. This is required to use Apify proxy!");
+
+                let username = settings.apifyProxyGroups
+                    .map(|groups| format!("groups-{}", groups.join("+")))
+                    .unwrap_or_else(|| "auto".to_owned());
+
+                return Ok(Proxy::new(username, password))
+            }
         }
-    };
-    Proxy::new(username, password)
+
+        Err(())
+    }
 }

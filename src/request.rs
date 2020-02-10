@@ -1,4 +1,7 @@
-#[derive(Serialize, Deserialize, Debug, Clone)]
+use reqwest::Client;
+use crate::storage::request_text;
+
+#[derive(Serialize, Deserialize, Debug)]
 pub struct Request {
     // id: String,
     pub url: String,
@@ -14,9 +17,24 @@ pub struct Request {
 }
 
 impl Request {
-    pub fn new(url: String) -> Request {
+    pub fn new(url: String) -> Self {
         Request {
             url
+        }
+    }
+
+    pub async fn fetch(&self, client: &Client) -> String {
+        request_text(&client, &self.url).await.unwrap_or_else(|err| {
+            debugln!("{}", err);
+            "".to_owned()
+        })
+    }
+}
+
+impl Clone for Request {
+    fn clone(&self) -> Self {
+        Request {
+            url: self.url.clone()
         }
     }
 }
